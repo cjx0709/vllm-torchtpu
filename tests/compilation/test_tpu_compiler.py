@@ -14,6 +14,7 @@
 
 import contextlib
 import importlib
+import importlib.util
 import os
 import re
 import weakref
@@ -902,24 +903,147 @@ class TestTpuCompilerCache:
         )
         assert "vllm_torchtpu/omni/rope.py" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
 
-    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
-        """A bucket's HLO, and so its cache key, must not depend on what the
-        rank compiled before it."""
+    @staticmethod
+    def _first_ids_per_compile(monkeypatch, *reservers, compiles=2, count=3):
+        """Compile `compiles` programs with a stub backend; in each, every
+        reserver asks for `count` scheduling group ids. Returns, per program,
+        the first id each reserver got."""
         from vllm_torchtpu.compilation import tpu_compiler
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         firsts = []
 
         def fake_backend(graph, example_inputs):
-            firsts.append(config.reserve_scheduling_group_ids(3))
+            firsts.append(tuple(reserve(count) for reserve in reservers))
             return lambda *args: args
 
         monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
         compiler = TpuCompilerAdaptor()
-        compiler._run_backend(None, [])
-        compiler._run_backend(None, [])
-        assert firsts == [1, 1]
+        for _ in range(compiles):
+            compiler._run_backend(None, [])
+        return firsts
+
+    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
+        """A bucket's HLO, and so its cache key, must not depend on what the
+        rank compiled before it."""
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        # As if this process had already traced other programs.
+        config.reserve_scheduling_group_ids(5)
+        firsts = self._first_ids_per_compile(
+            monkeypatch, config.reserve_scheduling_group_ids
+        )
+        assert firsts == [(1,), (1,)]
+
+    def test_kernels_share_one_scheduling_group_counter(self, monkeypatch):
+        """Two kernels in one program (say the reference kernel and a
+        per-model copy) get disjoint ids, and every program starts at 1."""
+        from vllm_torchtpu.kernels import scheduling_groups
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        assert (
+            config.reserve_scheduling_group_ids
+            is scheduling_groups.reserve_scheduling_group_ids
+        )
+        assert (
+            config.reset_scheduling_group_ids
+            is scheduling_groups.reset_scheduling_group_ids
+        )
+        scheduling_groups.reserve_scheduling_group_ids(5)
+        firsts = self._first_ids_per_compile(
+            monkeypatch,
+            config.reserve_scheduling_group_ids,
+            scheduling_groups.reserve_scheduling_group_ids,
+        )
+        assert firsts == [(1, 4), (1, 4)]
+
+    def test_runtime_hash_covers_model_kernel_dirs(self, tmp_path, monkeypatch):
+        """Adding or editing a file in any `models/**/kernels/` or
+        `models/**/ops/` directory changes the compile cache key; a model
+        without one is a no-op. In kernel-iteration mode only the hot-reloaded
+        module drops out."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        repo_root = tmp_path.resolve()
+        package = repo_root / "vllm_torchtpu"
+        (package / "compilation").mkdir(parents=True)
+        (package / "kernels").mkdir()
+        (package / "kernels" / "reference.py").write_text("REF = 1\n")
+        (package / "models" / "plain_model").mkdir(parents=True)
+        (package / "models" / "plain_model" / "model.py").write_text("M = 1\n")
+        # A plain file named like a discovered directory is not a package.
+        (package / "models" / "plain_model" / "ops").write_text("not python\n")
+        # compute_tpu_compilation_hash finds the source root from __file__.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "__file__",
+            str(package / "compilation" / "tpu_compiler.py"),
+        )
+
+        def hashed_relpaths():
+            return [
+                path.relative_to(repo_root).as_posix()
+                for path in tpu_compiler._iter_runtime_cache_key_files(repo_root)
+            ]
+
+        def cache_key():
+            return tpu_compiler.compute_tpu_compilation_hash(self._config())
+
+        keys = [cache_key()]
+        assert not [p for p in hashed_relpaths() if "/models/" in p]
+
+        nested = package / "models" / "vllm" / "fake_model" / "kernels" / "topk"
+        nested.mkdir(parents=True)
+        (nested / "config.py").write_text("TOP_K = 512\n")
+        keys.append(cache_key())
+
+        (nested / "config.py").write_text("TOP_K = 256\n")
+        keys.append(cache_key())
+
+        flat = package / "models" / "flat_model" / "kernels"
+        flat.mkdir(parents=True)
+        (flat / "kernel.py").write_text("K = 1\n")
+        keys.append(cache_key())
+
+        ops = package / "models" / "vllm" / "fake_model" / "ops"
+        ops.mkdir(parents=True)
+        (ops / "topk_op.py").write_text("OP = 1\n")
+        keys.append(cache_key())
+
+        assert len(set(keys)) == len(keys)
+        relpaths = hashed_relpaths()
+        assert relpaths == sorted(relpaths)
+        model_files = {
+            "vllm_torchtpu/models/flat_model/kernels/kernel.py",
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py",
+            "vllm_torchtpu/models/vllm/fake_model/ops/topk_op.py",
+        }
+        assert model_files <= set(relpaths)
+        assert "vllm_torchtpu/models/plain_model/model.py" not in relpaths
+        assert "vllm_torchtpu/models/plain_model/ops" not in relpaths
+
+        # Kernel-iteration mode: the module listed for hot reload leaves the
+        # key, every other discovered file stays.
+        reloaded = "vllm_torchtpu.models.vllm.fake_model.kernels.topk.config"
+        monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "1")
+        monkeypatch.setenv("TPU_KERNEL_RELOAD_MODULES", reloaded)
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *args, **kwargs):
+            if name != reloaded:
+                return real_find_spec(name, *args, **kwargs)
+            return SimpleNamespace(
+                origin=str(repo_root / (name.replace(".", "/") + ".py"))
+            )
+
+        monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+        iter_relpaths = hashed_relpaths()
+        assert set(relpaths) - set(iter_relpaths) == {
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py"
+        }
+        assert model_files - set(iter_relpaths) == {
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py"
+        }
 
     @staticmethod
     def _peer_compilers(tmp_path, monkeypatch, n=2, peer_replay="1"):
